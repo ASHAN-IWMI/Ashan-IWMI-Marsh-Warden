@@ -254,6 +254,14 @@ def load_custom_css(dark_mode=False):
         background-color: transparent !important;
     }}
 
+    /* Explicitly set text color for message content to ensure readability in light mode */
+    [data-testid="stChatMessageContent"] p,
+    [data-testid="stChatMessageContent"] li,
+    [data-testid="stChatMessageContent"] span,
+    [data-testid="stChatMessageContent"] div {{
+        color: {text_primary} !important;
+    }}
+
     /* User Messages */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {{
         background: {"linear-gradient(135deg, #334155 0%, #475569 100%)" if dark_mode else "linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%)"};
@@ -550,15 +558,24 @@ def load_custom_css(dark_mode=False):
         background: {"#1e293b" if dark_mode else "#334155"} !important;
     }}
     
-    /* Input Styling */
+    /* Input Styling & Bottom Bar Fix */
+    [data-testid="stBottom"],
+    [data-testid="stBottomBlockContainer"],
+    [data-testid="stChatInputContainer"],
+    footer {{
+        background-color: transparent !important;
+        background: transparent !important;
+    }}
+
     .stChatInput {{
         border-radius: 24px;
+        background-color: transparent !important;
     }}
     
     .stChatInput > div {{
         border-radius: 24px;
         border: 2px solid {"#334155" if dark_mode else "#E2E8F0"};
-        background: {bg_card};
+        background: {bg_card} !important;
         transition: all 0.2s ease;
     }}
     
@@ -570,6 +587,8 @@ def load_custom_css(dark_mode=False):
     .stChatInput textarea,
     .stChatInput input {{
         border-radius: 24px !important;
+        background-color: {bg_card} !important;
+        color: {text_primary} !important;
     }}
     
     /* Expander Styling */
@@ -900,8 +919,7 @@ def load_custom_css(dark_mode=False):
 
     button[key="auto_download_btn"] {{ display: none !important; }}
     
-    /* Dark mode global text */
-    {"" if not dark_mode else f'''
+    /* Global text color enforcement for the active theme */
     .stMarkdown, .stText, p, span, label, .stSelectbox label, .stRadio label {{
         color: {text_primary} !important;
     }}
@@ -921,7 +939,6 @@ def load_custom_css(dark_mode=False):
         color: {text_primary} !important;
         border-color: {border_color} !important;
     }}
-    '''}
     </style>
     """, unsafe_allow_html=True)
 
