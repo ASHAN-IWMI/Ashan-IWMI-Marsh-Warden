@@ -7,7 +7,6 @@ import hashlib
 from uuid import uuid4
 import requests
 import base64
-from streamlit_chat_widget import chat_input_widget
 from streamlit_float import float_init
 import tiktoken
 import logging
@@ -1733,122 +1732,9 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
 
-    # Generate PDF data for the widget to use
-    pdf_data_b64 = None
-    if st.session_state.messages:
-        pdf_content = export_conversation_pdf()
-        if pdf_content:
-            pdf_data_b64 = base64.b64encode(pdf_content).decode()
 
-    # ===== Custom Chat Input Widget (Fixed at Bottom) =====
-    footer_container = st.container()
-    with footer_container:
-        # Always render the widget so the chat bar stays visible
-        widget_key = f"chat_widget_{len(st.session_state.messages)}"
-        user_input = None
-        try:
-            user_input = chat_input_widget(
-                key=widget_key,
-                pdf_data=pdf_data_b64,
-                pdf_filename=f"Marsh Warden_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                dark_mode=st.session_state.dark_mode,
-                show_suggestions=(False))
-        except Exception as e:
-            import traceback, sys
-            tb = traceback.format_exc()
-            print("chat_input_widget failed:", e, file=sys.stderr)
-            st.error("⚠️ Custom chat input widget failed to initialize. Falling back to the default chat input.")
-            if os.environ.get("STREAMLIT_SERVER_ENABLE_WS"):
-                st.text_area("Widget traceback (dev only)", tb, height=200)
-            text_fallback = st.chat_input("Start typing here (widget disabled).")
-            if text_fallback:
-                user_input = {"text": text_fallback}
-
-        # Block any input while processing (don't process the widget value)
-        if st.session_state.get("is_processing", False):
-            user_input = None
-
-    # Float the container
-    footer_container.float("bottom: 0px; background-color: transparent; padding: 10px 0; pointer-events: none;")
-
-    # Re-enable pointer events for widget; disable send button during processing via CSS
-    is_proc = st.session_state.get("is_processing", False)
-    send_btn_css = """
-        /* Disable the send button inside the chat widget iframe via pointer-events on the iframe host */
-        [data-testid="stVerticalBlock"] > div:has(iframe[title*="chat_input_widget"]) iframe {
-            pointer-events: none !important;
-            opacity: 0.5 !important;
-        }
-    """ if is_proc else ""
-
-    st.markdown(f"""
-    <style>
-    [data-testid="stVerticalBlock"] > div:has(iframe[title*="chat_input_widget"]) {{
-        pointer-events: auto !important;
-    }}
-    {send_btn_css}
-    </style>
-    """, unsafe_allow_html=True)
-    
-    # Process user input from custom widget (text or audio)
-    prompt = None
-    
-    if user_input:
-
-        if "text" in user_input and user_input["text"]:
-            # Text input from typing
-            prompt = user_input["text"]
-        elif "audioFile" in user_input:
-            # Audio input from recording: accept multiple serialized formats
-            raw_audio = user_input.get("audioFile")
-            audio_bytes = None
-            try:
-                if isinstance(raw_audio, (bytes, bytearray)):
-                    audio_bytes = bytes(raw_audio)
-                elif isinstance(raw_audio, dict):
-                    # Uint8Array serialized as {"0":v0,"1":v1,...} - values may be int or str
-                    audio_bytes = bytes([int(raw_audio[k]) for k in sorted(raw_audio, key=int)])
-                elif isinstance(raw_audio, (list, tuple)):
-                    audio_bytes = bytes(raw_audio)
-                elif isinstance(raw_audio, str):
-                    # data URL: data:audio/wav;base64,<payload>
-                    if raw_audio.startswith("data:") and "," in raw_audio:
-                        b64 = raw_audio.split(",", 1)[1]
-                        audio_bytes = base64.b64decode(b64)
-                    else:
-                        # attempt base64 decode
-                        try:
-                            audio_bytes = base64.b64decode(raw_audio)
-                        except Exception:
-                            audio_bytes = None
-                else:
-                    audio_bytes = bytes(list(raw_audio))
-            except Exception as e:
-                st.error(f"❌ Failed to parse audio payload: {e}")
-                audio_bytes = None
-
-            if audio_bytes:
-                with st.spinner("🎙️ Transcribing audio..."):
-                    transcribed_text = transcribe_audio(audio_bytes)
-                # find the last "Transcribing audio..." placeholder (should be the one we added)
-                status_idx = None
-                for i in range(len(st.session_state.messages) - 1, -1, -1):
-                    if st.session_state.messages[i].get("content") == "🎙️ Transcribing audio...":
-                        status_idx = i
-                        break
-
-                if transcribed_text:
-                    # update the placeholder message to 'Transcribed: ...'
-                    if status_idx is not None:
-                        st.session_state.messages[status_idx]["content"] = f"🎙️ Transcribed: {transcribed_text}"
-                    # set the prompt so the regular pipeline handles the next steps (append user + fetch assistant)
-                    prompt = transcribed_text
-                else:
-                    # transcription failed - update placeholder to an error message
-                    if status_idx is not None:
-                        st.session_state.messages[status_idx]["content"] = "⚠️ Transcription failed."
-                # persist changes
-                save_chat_history(user_email, st.session_state.messages, st.session_state.total_queries, st.session_state.model)
+    # ===== Chat Input =====
+    prompt = st.chat_input("Ask Marsh Warden...", disabled=st.session_state.get("is_processing", False))
 
     # ── PHASE 1: New user input arrives → save it, lock UI, rerun ────────────
     if prompt and not st.session_state.get("pending_prompt"):
@@ -2311,34 +2197,6 @@ def get_user_initial(name: str) -> str:
         return name[0].upper()
     return "U"
 
-def transcribe_audio(audio_bytes):
-    """Audio transcription - currently disabled (HuggingFace removed)."""
-    if not audio_bytes:
-        return None
-    # HuggingFace Whisper transcription has been removed.
-    # To re-enable, integrate a different transcription service.
-    logger.warning("Audio transcription is disabled. HuggingFace API removed.")
-    return None
-
-    # --- DISABLED CODE BELOW ---
-    API_URL = "https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3"
-    headers = {
-        "Authorization": "Bearer DISABLED",
-        "Content-Type": "audio/wav" 
-    }
-    
-    try:
-        response = requests.post(API_URL, headers=headers, data=audio_bytes)
-        
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("text", "").strip()
-        else:
-            st.error(f"Transcription failed: {response.status_code} - {response.text}")
-            return None
-    except Exception as e:
-        st.error(f"Error connecting to transcription service: {e}")
-        return None
 
 def clean_text_for_pdf(text):
     replacements = {

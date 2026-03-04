@@ -32,4 +32,3 @@ tenacity
 python-dateutil
 PyYAML
 tiktoken
-./Chat_input_widget-master
