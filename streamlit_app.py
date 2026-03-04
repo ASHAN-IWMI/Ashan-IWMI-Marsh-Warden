@@ -11,13 +11,23 @@ from streamlit_chat_widget import chat_input_widget
 from streamlit_float import float_init
 import tiktoken
 import logging
-
-# Import RAG pipeline (Gemini-powered version with query() method)
-from rag_pipeline import RAGPipeline
-from google_auth import check_google_auth
+from typing import List, Dict
+import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Import RAG pipeline versions
+try:
+    from rag_pipeline2 import RAGPipeline2
+except ImportError as e:
+    logger.error(f"Error importing pipeline: {e}")
+    st.error(f"Critical error: Could not load rag_pipeline2.py.")
+    st.stop()
+
+from google_auth import check_google_auth
+from token_manager import get_gemini_rotator
+
 
 # ------------------- CONFIG -------------------
 INDEX_FILE = ["pdf_index_enhanced1.pkl", "pdf_index_enhanced2.pkl", "pdf_index_enhanced3.pkl"]
@@ -48,7 +58,7 @@ def init_session_state():
     if "total_queries" not in st.session_state:
         st.session_state.total_queries = 0
     if "model" not in st.session_state:
-        st.session_state.model = "Gemma 4B (Gemini)"
+        st.session_state.model = "Marsh Thinking"
     if "rag_loaded" not in st.session_state:
         st.session_state.rag_loaded = False
     if "is_switching" not in st.session_state:
@@ -59,6 +69,10 @@ def init_session_state():
         st.session_state.saved_chat = None
     if "chat_loaded" not in st.session_state:
         st.session_state.chat_loaded = False
+    if "is_processing" not in st.session_state:
+        st.session_state.is_processing = False
+    if "pending_prompt" not in st.session_state:
+        st.session_state.pending_prompt = None
 
 # =============== CUSTOM CSS (same as before, keeping it concise) ===============
 
@@ -86,6 +100,66 @@ def load_custom_css(dark_mode=False):
         border_color = "#E2E8F0"
         accent = PRIMARY_COLOR
         accent_secondary = ACCENT_COLOR
+
+    st.markdown(f"""
+    <style>
+    /* === Engine Switcher Premium UI === */
+    .engine-switcher-container {{
+        background: {bg_card};
+        border-radius: 12px;
+        padding: 4px;
+        border: 1px solid {border_color};
+        margin-bottom: 1rem;
+    }}
+    
+    .engine-option {{
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 14px;
+        border-radius: 8px;
+        margin-bottom: 4px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        border: 1px solid transparent;
+        text-decoration: none !important;
+    }}
+    
+    .engine-option:hover {{
+        background: {bg_hover};
+    }}
+    
+    .engine-option.active {{
+        background: {accent}15;  /* 15% opacity */
+        border-color: {accent}40;
+    }}
+    
+    .engine-name {{
+        font-weight: 600;
+        font-size: 0.85rem;
+        color: {text_primary};
+    }}
+    
+    .engine-status {{
+        font-size: 0.75rem;
+        color: {accent};
+        font-weight: 700;
+    }}
+    
+    .engine-desc {{
+        font-size: 0.7rem;
+        color: {text_secondary};
+        display: block;
+        margin-top: 2px;
+    }}
+    
+    .selection-tick {{
+        color: {accent};
+        font-size: 1rem;
+        font-weight: bold;
+    }}
+    </style>
+    """, unsafe_allow_html=True)
     
     st.markdown(f"""
     <style>
@@ -270,6 +344,57 @@ def load_custom_css(dark_mode=False):
         background: {"#1e1b4b" if dark_mode else "#E0E7FF"};
         color: {"#a5b4fc" if dark_mode else "#4F46E5"} !important;
         border: 1px solid {"#3730a3" if dark_mode else "#C7D2FE"};
+    }}
+
+    /* Premium Model Panel - from user image */
+    .model-panel {{
+        background: linear-gradient(135deg, #10B981 0%, #059669 100%);
+        border-radius: 30px;
+        padding: 2rem 1.5rem;
+        text-align: center;
+        color: white !important;
+        margin-bottom: 1.5rem;
+        box-shadow: 0 10px 30px rgba(5, 150, 105, 0.2);
+        position: relative;
+        overflow: hidden;
+    }}
+
+    .model-panel-title {{
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: white !important;
+        margin: 0;
+        letter-spacing: -0.5px;
+    }}
+
+    .model-panel-icon {{
+        position: absolute;
+        bottom: 15px;
+        right: 15px;
+        opacity: 0.6;
+        font-size: 1.2rem;
+    }}
+
+    /* Premium Selectbox Styling - target the specific container */
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] {{
+        background: linear-gradient(135deg, #10B981 0%, #059669 100%) !important;
+        border-radius: 20px !important;
+        border: none !important;
+        box-shadow: 0 8px 24px rgba(16, 185, 129, 0.2) !important;
+    }}
+    
+    /* Target the text and dropdown arrow specifically to ensure visibility */
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] div,
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] span,
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] svg {{
+        color: white !important;
+        background-color: transparent !important;
+        font-weight: 600 !important;
+        font-size: 1.1rem !important;
+    }}
+
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] label {{
+        display: none !important;
     }}
     
     /* Sidebar Styling */
@@ -817,16 +942,6 @@ def main():
         initial_sidebar_state="expanded"
     )
 
-    # Check for secrets first to avoid crashing with a KeyError
-    # Check for secrets first to avoid crashing with a KeyError
-def main():
-    st.set_page_config(
-        page_title="Marsh Warden",
-        layout="wide",
-        page_icon="🌿",
-        initial_sidebar_state="expanded"
-    )
-
     # Check for required secrets
     required_secrets = ["GOOGLE_API_KEY", "client_id", "client_secret", "redirect_uri"]
     missing_secrets = [secret for secret in required_secrets if secret not in st.secrets]
@@ -936,28 +1051,43 @@ def main():
             </div>
             """, unsafe_allow_html=True)
             
-            # Actual Streamlit logout button
+            # Sign Out button
             if st.button("↗️ Sign Out", key="logout_btn", use_container_width=True):
-                # Import logout function
                 from google_auth import logout
                 logout()
             
-            # Dark mode toggle
+            # Dark / Light mode toggle
             st.markdown('<div style="margin-top: 0.5rem;"></div>', unsafe_allow_html=True)
             if st.button("🌙 Dark Mode" if not st.session_state.dark_mode else "☀️ Light Mode", key="theme_toggle_btn", use_container_width=True):
                 st.session_state.dark_mode = not st.session_state.dark_mode
                 st.rerun()
     
-    # Professional loading screen
+    # ── Pipeline load (Marsh Thinking · RAGPipeline2 · gemma-3-12b-it) ───────
     if not st.session_state.rag_loaded:
-        spinner_text = "🌿 Switching AI Model... Please wait." if st.session_state.is_switching else "🌿 Loading Marsh Warden Agent..."
-        with st.spinner(spinner_text):
-            # get_rag_pipeline now handles load_index() internally
-            # Incrementing cache_breaker (version 3) for Gemma 3 12B upgrade
-            rag = get_rag_pipeline(st.session_state.model, cache_breaker=3)
-            st.session_state.rag_loaded = True
-            st.session_state.rag = rag
-            st.session_state.is_switching = False
+        with st.spinner("🌿 Loading Marsh Warden Agent..."):
+            history = st.session_state.get("messages", [])
+            rotator = get_gemini_rotator()
+            if not rotator:
+                st.error("⚠️ Gemini API Key Rotator could not be initialized.")
+                st.stop()
+
+            idx, key = rotator.get_next_key()
+            genai.configure(api_key=key)
+
+            rag = RAGPipeline2(
+                pdf_folder="",
+                index_file=INDEX_FILE,
+                model_params={"google_api_key": "", "model_name": "models/gemma-3-12b-it"},
+                gemini_rotator=rotator,
+            )
+            rag.load_index()
+
+            if history:
+                rag.set_history(history)
+
+            st.session_state.rag         = rag
+            st.session_state.rag_loaded  = True
+            st.session_state.model       = "Marsh Thinking"
             st.rerun()
     
     rag = st.session_state.rag
@@ -998,18 +1128,7 @@ def main():
         </style>
         """, unsafe_allow_html=True)
         
-        # Divider after profile
-        st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
-        
-       
-        
-        # Model Selection - without section box
-        st.markdown('<div class="section-content">', unsafe_allow_html=True)
-        st.session_state.model = "DeepSeek"
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Divider
+        # Divider after profile card
         st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
         
         st.markdown('<h4 class="control-panel-header">Chat Management</h4>', unsafe_allow_html=True)
@@ -1624,7 +1743,7 @@ def main():
     # ===== Custom Chat Input Widget (Fixed at Bottom) =====
     footer_container = st.container()
     with footer_container:
-        # Use message count as key to reset widget after each send (prevents duplicate re-sends on rerun)
+        # Always render the widget so the chat bar stays visible
         widget_key = f"chat_widget_{len(st.session_state.messages)}"
         user_input = None
         try:
@@ -1635,32 +1754,39 @@ def main():
                 dark_mode=st.session_state.dark_mode,
                 show_suggestions=(False))
         except Exception as e:
-            # Log minimal error info and present fallback so the app remains functional
             import traceback, sys
             tb = traceback.format_exc()
             print("chat_input_widget failed:", e, file=sys.stderr)
-            print(tb, file=sys.stderr)
-            # Show concise, non-sensitive message in the UI and provide the traceback for debugging
             st.error("⚠️ Custom chat input widget failed to initialize. Falling back to the default chat input.")
-            # (Optional) show debug info only when running locally or if you decide to expose it
-            if os.environ.get("STREAMLIT_SERVER_ENABLE_WS"):  # local/dev heuristic; remove if needed
+            if os.environ.get("STREAMLIT_SERVER_ENABLE_WS"):
                 st.text_area("Widget traceback (dev only)", tb, height=200)
-            # Fallback to a simple text input: allow the app to keep working
             text_fallback = st.chat_input("Start typing here (widget disabled).")
             if text_fallback:
                 user_input = {"text": text_fallback}
-    
-    # Float the container - transparent background, pointer-events: none allows scrolling through it
+
+        # Block any input while processing (don't process the widget value)
+        if st.session_state.get("is_processing", False):
+            user_input = None
+
+    # Float the container
     footer_container.float("bottom: 0px; background-color: transparent; padding: 10px 0; pointer-events: none;")
-    
-    # Re-enable pointer events for the widget inside using CSS
-    st.markdown("""
+
+    # Re-enable pointer events for widget; disable send button during processing via CSS
+    is_proc = st.session_state.get("is_processing", False)
+    send_btn_css = """
+        /* Disable the send button inside the chat widget iframe via pointer-events on the iframe host */
+        [data-testid="stVerticalBlock"] > div:has(iframe[title*="chat_input_widget"]) iframe {
+            pointer-events: none !important;
+            opacity: 0.5 !important;
+        }
+    """ if is_proc else ""
+
+    st.markdown(f"""
     <style>
-    [data-testid="stVerticalBlock"] > div:has(iframe[title*="chat_input_widget"]) {
+    [data-testid="stVerticalBlock"] > div:has(iframe[title*="chat_input_widget"]) {{
         pointer-events: auto !important;
-    }
-                
-    
+    }}
+    {send_btn_css}
     </style>
     """, unsafe_allow_html=True)
     
@@ -1724,10 +1850,13 @@ def main():
                 # persist changes
                 save_chat_history(user_email, st.session_state.messages, st.session_state.total_queries, st.session_state.model)
 
-    if prompt:
-        # Add user message to session state
+    # ── PHASE 1: New user input arrives → save it, lock UI, rerun ────────────
+    if prompt and not st.session_state.get("pending_prompt"):
+        st.session_state.pending_prompt = prompt
+        st.session_state.is_processing = True
+
+        # Add user message to history immediately so it shows on next rerun
         st.session_state.messages.append({"role": "user", "content": prompt})
-        # Persist user message immediately to avoid losing it if processing fails
         if st.session_state.get("guest_authenticated") and st.session_state.get("guest_session_id"):
             store = _guest_store()
             store[st.session_state.guest_session_id] = {
@@ -1737,30 +1866,37 @@ def main():
             }
         else:
             save_chat_history(user_email, st.session_state.messages, st.session_state.total_queries, st.session_state.model)
-        
-        # Build conversation history for agent (only user/assistant messages, no tool messages)
-        conv_history = []
-        for msg in st.session_state.messages[:-1]:  # Exclude current user message
-            if msg["role"] in ["user", "assistant"]:
-                conv_history.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
-        
-        # Process query using Gemini RAG pipeline (Synchronous)
+        st.rerun()  # ← rerun NOW: banner is shown, input locked, query not yet run
+
+    # ── PHASE 2: Locked rerun → run the query ─────────────────────────────────
+    if st.session_state.get("pending_prompt") and st.session_state.get("is_processing"):
+        pending = st.session_state.pending_prompt
+
         with st.chat_message("assistant", avatar="🤖"):
             try:
-                with st.status("Thinking March Warden...", expanded=True) as status:
-                    full_response = rag.query(prompt)
-                    status.update(label="Response generated!", state="complete", expanded=False)
-                st.write(full_response)
-                
-                # Retrieve docs from pipeline state (stored during query() for UI references)
-                retrieved_docs = getattr(rag, "last_retrieved_docs", [])
-                
+                if "query_cache" not in st.session_state:
+                    st.session_state.query_cache = {}
+
+                cache_key = f"{st.session_state.model}_{pending.strip().lower()}"
+
+                if cache_key in st.session_state.query_cache:
+                    logger.info("Serving response from session cache")
+                    cached = st.session_state.query_cache[cache_key]
+                    full_response = cached["response"]
+                    retrieved_docs = cached["docs"]
+                    st.write(full_response)
+                else:
+                    with st.status("🔍 Marsh Warden researching...", expanded=True) as status:
+                        full_response = rag.query(pending)
+                        status.update(label="✅ Response ready!", state="complete", expanded=False)
+                    st.write(full_response)
+                    retrieved_docs = getattr(rag, "last_retrieved_docs", [])
+                    st.session_state.query_cache[cache_key] = {
+                        "response": full_response,
+                        "docs": retrieved_docs
+                    }
+
                 msg_id = f"msg-{len(st.session_state.messages)}"
-                
-                # Add assistant response to session history
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": full_response,
@@ -1768,9 +1904,8 @@ def main():
                     "msg_id": msg_id
                 })
                 st.session_state.total_queries += 1
-                
                 logger.info(f"Query processed with {len(retrieved_docs)} references")
-            
+
             except Exception as e:
                 logger.error(f"Query error: {e}")
                 error_msg = f"⚠️ **Processing Error**\n\nI encountered an issue: `{str(e)}`\n\nPlease try again."
@@ -1780,8 +1915,12 @@ def main():
                     "references": [],
                     "msg_id": f"msg-{len(st.session_state.messages)}"
                 })
-        
-        # Save chat history to file after each message
+            finally:
+                # Always release lock and clear pending prompt
+                st.session_state.is_processing = False
+                st.session_state.pending_prompt = None
+
+        # Save and rerun to show final state with unlocked input
         if st.session_state.get("guest_authenticated") and st.session_state.get("guest_session_id"):
             store = _guest_store()
             store[st.session_state.guest_session_id] = {
@@ -1791,8 +1930,6 @@ def main():
             }
         else:
             save_chat_history(user_email, st.session_state.messages, st.session_state.total_queries, st.session_state.model)
-        
-        # Rerun to display the updated messages
         st.rerun()
     
     # Footer
@@ -2097,7 +2234,7 @@ def list_archived_histories(email: str) -> list:
         files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return files
     except Exception as e:
-        print(f"Error listing archives: {e}")
+        logger.warning(f"Error listing archives: {e}")
         return []
 
 def load_archived_history(path: str) -> dict | None:
@@ -2107,7 +2244,7 @@ def load_archived_history(path: str) -> dict | None:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        print(f"Error loading archive {path}: {e}")
+        logger.warning(f"Error loading archive {path}: {e}")
         return None
 
 def delete_archived_history(path: str) -> bool:
@@ -2296,28 +2433,56 @@ def export_conversation_pdf():
 # =============== RAG PIPELINE ===============
 
 @st.cache_resource(show_spinner=False)
-def get_rag_pipeline(selected_model: str, cache_breaker: int = 1):
-    """Initialize RAG pipeline with Gemini API (Gemma 4B)"""
-    logger.info(f"🚀 Initializing RAG Pipeline (version {cache_breaker})...")
-    if not GOOGLE_API_KEY:
-        st.error("⚠️ GOOGLE_API_KEY not found. Please set it in .streamlit/secrets.toml or as an environment variable.")
+def get_rag_pipeline(selected_model: str, cache_breaker: str = "default"):
+    """Initialize RAG pipeline with either Pipeline 1 (4B) or Pipeline 2 (12B)"""
+    logger.info(f"[PROCESS] Initializing RAG Pipeline for {selected_model} (Breaker: {cache_breaker})...")
+    
+    rotator = get_gemini_rotator()
+    if not rotator:
+        st.error("⚠️ Gemini API Key Rotator could not be initialized.")
         st.stop()
     
+    # ── Pipeline & model routing ────────────────────────────────────────────
+    # Marsh Fast     → RAGPipeline1  ·  models/gemma-3-4b-it   (speed)
+    # Marsh Thinking → RAGPipeline2  ·  models/gemma-3-12b-it  (accuracy)
+    # Each engine is strictly bound to its own pipeline class AND model.
+    # Switching only changes which cached instance is active — no cross-mixing.
+    if selected_model == "Marsh Thinking":
+        pipeline_class = RAGPipeline2          # deeper reasoning pipeline
+        model_id = "models/gemma-3-12b-it"    # Gemma 12B — accuracy optimised
+        logger.info("[Engine] Marsh Thinking → RAGPipeline2 · gemma-3-12b-it")
+    else:
+        # Default: Marsh Fast
+        pipeline_class = RAGPipeline1          # fast-response pipeline
+        model_id = "models/gemma-3-4b-it"     # Gemma 4B  — speed optimised
+        logger.info("[Engine] Marsh Fast → RAGPipeline1 · gemma-3-4b-it")
+
     params = {
-        "google_api_key": GOOGLE_API_KEY,
-        "model_name": "models/gemma-3-12b-it",
+        "google_api_key": "",  # Rotator supplies keys dynamically
+        "model_name": model_id,
     }
     
-    pipeline = RAGPipeline(
-        pdf_folder="",  # Not needed for runtime, only for building the index
+    pipeline = pipeline_class(
+        pdf_folder="",  # Not needed for runtime
         index_file=INDEX_FILE,
         model_params=params,
+        gemini_rotator=rotator,
     )
     
     # Pre-load the index
     if not pipeline.load_index():
-        logger.warning("Could not load existing index - app functionality will be limited.")
-    
+        logger.warning("Could not load existing index.")
+
+    # ── Terminal confirmation ─────────────────────────────────────────────────────────
+    print(
+        f"\n{'='*60}\n"
+        f"  ✅  PIPELINE READY  ({selected_model})\n"
+        f"  Class   : {pipeline_class.__name__}\n"
+        f"  Model   : {model_id}\n"
+        f"  Index   : {INDEX_FILE}\n"
+        f"{'='*60}\n",
+        flush=True
+    )
     return pipeline
 
 @st.cache_resource(show_spinner=False)

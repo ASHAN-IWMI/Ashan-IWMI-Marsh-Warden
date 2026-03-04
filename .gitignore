@@ -58,6 +58,7 @@ SYSTEM_AND_DEVELOPMENT_SPEC.md
 
 # Build and distribution
 build/
+!Chat_input_widget-master/streamlit_chat_widget/frontend/build/
 dist/
 *.egg-info/
 .eggs/

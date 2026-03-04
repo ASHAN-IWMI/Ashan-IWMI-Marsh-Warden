@@ -1,0 +1,14 @@
+{
+  "user_email": "guest@local",
+  "timestamp": "2026-02-20T15:11:01.501099",
+  "title": "1.\tWhat is the definition of a 'wetland' according to Sri...",
+  "messages": [
+    {
+      "role": "user",
+      "content": "1.\tWhat is the definition of a 'wetland' according to Sri Lankan policy?"
+    },
+    {
+      "role": "assistant",
+      "content": "According to the National Wetland Policy [National Wetland Policy, p. 3-5], a wetland is defined as an area of land where the soil is saturated with water either permanently or seasonally. This includes areas such as marshes, swamps, and floodplains, and encompasses both naturally occurring and artificially created areas with a significant water table or surface water.",
+      "references": [
+        

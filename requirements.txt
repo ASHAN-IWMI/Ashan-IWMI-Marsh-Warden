@@ -32,5 +32,4 @@ tenacity
 python-dateutil
 PyYAML
 tiktoken
-streamlit-chat-widget
 ./Chat_input_widget-master

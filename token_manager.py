@@ -1,5 +1,6 @@
 # token_manager.py
 import streamlit as st
+import os
 import logging
 from threading import Lock
 from datetime import datetime, timedelta
@@ -100,6 +101,106 @@ class HFTokenRotator:
         return available
 
 
+class GeminiTokenRotator:
+    def __init__(self, api_keys):
+        self.api_keys = api_keys
+        self.total_keys = len(api_keys)
+        self.current_index = 0
+        self.failed_keys = set()
+        self.lock = Lock()
+        
+        # Track usage and cooldown per key
+        self.usage_stats = {
+            i: {
+                "requests": 0,
+                "failures": 0,
+                "last_failure": None,
+                "cooldown_until": None
+            } for i in range(self.total_keys)
+        }
+        
+        logger.info(f"✅ GeminiTokenRotator initialized with {self.total_keys} keys")
+    
+    def get_next_key(self):
+        """Get next available Gemini API key with round-robin and cooldown management"""
+        with self.lock:
+            attempts = 0
+            now = datetime.now()
+            
+            while attempts < self.total_keys:
+                key_idx = self.current_index
+                self.current_index = (self.current_index + 1) % self.total_keys
+                
+                # Check if key is in cooldown
+                cooldown_until = self.usage_stats[key_idx].get("cooldown_until")
+                if cooldown_until and now < cooldown_until:
+                    attempts += 1
+                    continue
+                
+                # Skip permanently failed keys
+                if key_idx not in self.failed_keys:
+                    api_key = self.api_keys[key_idx]
+                    masked_key = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else "****"
+                    msg = f"🔑 Using Google Gemini API Key #{key_idx + 1}/{self.total_keys} ({masked_key})"
+                    print(f"\n{msg}")
+                    logger.info(msg)
+                    return key_idx, api_key
+                
+                attempts += 1
+            
+            # All keys are either failed or in cooldown
+            # Reset cooldowns and try again
+            logger.warning("⚠️ All Gemini API keys exhausted or in cooldown, resetting cooldowns...")
+            for idx in range(self.total_keys):
+                self.usage_stats[idx]["cooldown_until"] = None
+            
+            self.failed_keys.clear()
+            return 0, self.api_keys[0]
+    
+    def mark_key_failed(self, key_idx, temporary=True, cooldown_minutes=15):
+        """Mark key as failed with optional cooldown"""
+        with self.lock:
+            if temporary:
+                self.usage_stats[key_idx]["failures"] += 1
+                self.usage_stats[key_idx]["last_failure"] = datetime.now()
+                # Quota limits on Gemini usually last longer, default 15 mins
+                msg = f"⏳ Gemini Key #{key_idx + 1} rate limited - cooldown {cooldown_minutes}min"
+                print(f"\n{msg}")
+                logger.warning(msg)
+            else:
+                self.failed_keys.add(key_idx)
+                logger.error(f"❌ Gemini Key #{key_idx + 1} permanently failed or invalid")
+    
+    def mark_key_success(self, key_idx):
+        """Remove key from failed list and clear cooldown on success"""
+        with self.lock:
+            self.failed_keys.discard(key_idx)
+            self.usage_stats[key_idx]["requests"] += 1
+            self.usage_stats[key_idx]["cooldown_until"] = None
+    
+    def get_stats(self):
+        """Get usage statistics"""
+        return {
+            "total_keys": self.total_keys,
+            "current_index": self.current_index,
+            "failed_count": len(self.failed_keys),
+            "usage": self.usage_stats
+        }
+    
+    def get_available_count(self):
+        """Get count of currently available keys"""
+        now = datetime.now()
+        available = 0
+        for idx in range(self.total_keys):
+            if idx in self.failed_keys:
+                continue
+            cooldown = self.usage_stats[idx].get("cooldown_until")
+            if cooldown and now < cooldown:
+                continue
+            available += 1
+        return available
+
+
 def load_hf_tokens_from_secrets():
     """Load all HF tokens from Streamlit secrets - matching your naming convention"""
     tokens = []
@@ -153,3 +254,43 @@ def get_token_rotator():
     """Initialize and cache the token rotator"""
     tokens = load_hf_tokens_from_secrets()
     return HFTokenRotator(tokens)
+
+
+def load_gemini_keys_from_secrets():
+    """Load all Gemini API keys from Streamlit secrets"""
+    keys = []
+    
+    # Primary key
+    if "GOOGLE_API_KEY" in st.secrets:
+        keys.append(st.secrets["GOOGLE_API_KEY"])
+        logger.info("✅ GOOGLE_API_KEY loaded")
+    
+    # Rotating keys: GOOGLE_API_KEY1, GOOGLE_API_KEY2, etc.
+    for i in range(1, 10):
+        key_name = f"GOOGLE_API_KEY{i}"
+        if key_name in st.secrets:
+            val = st.secrets[key_name]
+            if val and val.strip():
+                keys.append(val)
+                logger.info(f"✅ {key_name} loaded")
+        else:
+            break
+            
+    if not keys:
+        logger.error("❌ No Gemini API keys found in secrets!")
+        # Fallback to environment variable if available
+        env_key = os.getenv("GOOGLE_API_KEY")
+        if env_key:
+            keys.append(env_key)
+            logger.info("✅ Loaded GOOGLE_API_KEY from environment fallback")
+            
+    return keys
+
+
+@st.cache_resource
+def get_gemini_rotator():
+    """Initialize and cache the Gemini API key rotator"""
+    api_keys = load_gemini_keys_from_secrets()
+    if not api_keys:
+        return None
+    return GeminiTokenRotator(api_keys)

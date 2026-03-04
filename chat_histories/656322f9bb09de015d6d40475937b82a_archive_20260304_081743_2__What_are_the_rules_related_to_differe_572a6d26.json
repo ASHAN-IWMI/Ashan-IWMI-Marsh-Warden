@@ -1,0 +1,14 @@
+{
+  "user_email": "guest@local",
+  "timestamp": "2026-03-04T08:17:43.589167",
+  "title": "2.\tWhat are the rules related to different protected area...",
+  "messages": [
+    {
+      "role": "user",
+      "content": "2.\tWhat are the rules related to different protected area categories - sanctuary, national park, strict nature reserve"
+    },
+    {
+      "role": "assistant",
+      "content": "Protected areas are crucial for biodiversity conservation in Sri Lanka, and are categorized to reflect varying levels of protection and management objectives. The **Fauna and Flora Protection Act** and the **National Parks and Wildlife Act** govern these designations.\n\nA **Sanctuary**, as defined in the **Fauna and Flora Protection Act** (p. 5), is an area declared to protect wildlife, including birds. The Minister can declare an area a sanctuary by order published in the Gazette (**Fauna and Flora Protection Act**, p. 10), specifying boundaries and management provisions. The primary focus is on wildlife protection.\n\nA **National Park**, according to the **National Parks and Wildlife Act** (p. 3), is an area declared to protect wildlife, plant life, scenic beauty, natural resources, and habitats. Similar to sanctuaries, the Minister declares National Parks via a Gazette notification (**National Parks and Wildlife Act**, p. 5), outlining boundaries and management controls. These parks aim for a broader range of conservation goals.\n\nA **Strict Nature Reserve**, as defined in the **National Parks and Wildlife Act** (p. 15), is designated primarily for protecting outstanding ecosystems, habitats, species, and biological processes. Like the other categories, declaration occurs through a Gazette notification, with management provisions determined by the Minister. The emphasis here is on preserving ecological integrity.\n\nHere's a summary table comparing the categories:\n\n| Category | Definition | Primary Purpose | Governing Act | Declaration Method |\n|---|---|---|---|---|\n| Sanctuary | Area declared for wildlife protection | Wildlife protection, especially birds | **Fauna and Flora Protection Act** | Gazette notification by Minister |\n| National Park | Area declared for wildlife, plant life, scenic beauty, and natural resources | Broader conservation goals | **National Parks and Wildlife Act** | Gazette notification by Minister |\n| Strict Nature Reserve | Area declared for protecting ecosystems and biological processes | Ecosystem protection and ecological integrity | **National Parks and Wildlife Act** | Gazette notification by Minister |\n\nThese categories provide a framework for managing Sri Lanka's natural heritage, with each designation tailored to specific conservation needs. [Fauna and Flora Protection Act, p. 5, 10] [National Parks and Wildlife Act, p. 3, 5, 15]\n\n**Sources Used:**\n- Fauna and Flora Protection Act, p. 5, 10\n- National Parks and Wildlife Act, p. 3, 5, 15",
+      "references": [
+        

@@ -23,6 +23,62 @@ from gemini_tools import ToolExecutor, get_tool_schemas_for_gemini, format_tool_
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class SemanticChunker:
+    """
+    Very simple semantic-ish chunker:
+    1) First split into small fixed chunks.
+    2) Then merge adjacent chunks whose embeddings are very similar.
+    """
+
+    def __init__(
+        self,
+        embedding_model: SentenceTransformer,
+        base_chunk_size: int = 512,
+        base_overlap: int = 50,
+        sim_threshold: float = 0.85,
+    ):
+        from langchain_text_splitters import CharacterTextSplitter
+
+        self.embedding_model = embedding_model
+        self.base_splitter = CharacterTextSplitter(
+            chunk_size=base_chunk_size,
+            chunk_overlap=base_overlap,
+            separator="\n\n",
+        )
+        self.sim_threshold = sim_threshold
+
+    def split_text(self, text: str) -> list[str]:
+        # 1) base split
+        mini_chunks = self.base_splitter.split_text(text)
+        if len(mini_chunks) <= 1:
+            return mini_chunks
+
+        # 2) embed all mini-chunks
+        embs = self.embedding_model.encode(
+            mini_chunks, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True
+        )
+
+        # 3) merge adjacent chunks with high cosine similarity
+        merged_chunks: list[str] = []
+        current = mini_chunks[0]
+        current_emb = embs[0]
+
+        for i in range(1, len(mini_chunks)):
+            # Round similarity to 6 decimal places to prevent floating-point drift across CPUs
+            sim = round(float(np.dot(current_emb, embs[i])), 6)
+            if sim >= self.sim_threshold:
+                # same topic: merge
+                current = current + " " + mini_chunks[i]
+                # update embedding as average of both (approx)
+                current_emb = (current_emb + embs[i]) / 2.0
+            else:
+                merged_chunks.append(current)
+                current = mini_chunks[i]
+                current_emb = embs[i]
+
+        merged_chunks.append(current)
+        return merged_chunks
+
 class EnsembleRetriever(BaseRetriever):
     """Ensemble retriever that combines multiple retrievers."""
     
@@ -198,6 +254,8 @@ class RelevanceChecker:
 
         sims = np.dot(doc_embeddings, q_emb.T).reshape(-1)
         sims = (sims + 1.0) / 2.0  # normalize to 0–1
+        # Round to 6 decimal places for deterministic thresholding across CPUs
+        sims = np.round(sims, 6)
 
         return sorted(list(zip(docs, sims.tolist())), key=lambda x: x[1], reverse=True)
 
@@ -345,6 +403,17 @@ class ConversationManager:
     def get_history(self) -> List[Dict[str, str]]:
         """Get current conversation history"""
         return self.history.copy()
+
+    def set_history(self, messages: List[Dict[str, str]]):
+        """Set history from external message list, ensuring token limits are respected"""
+        self.history = []
+        for msg in messages:
+            if msg.get("role") in ["user", "assistant"]:
+                self.history.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+        self._truncate_to_fit()
     
     def get_history_tokens(self) -> int:
         """Get current token count of history"""
@@ -551,24 +620,36 @@ class PDFExtractor:
         return text.strip()
 
 
-class RAGPipeline:
-    """Main RAG pipeline for PDF question answering with Gemini API (Gemma 4B)"""
+class RAGPipeline2:
+    """Main RAG pipeline for PDF question answering with Gemini API (Gemma 12B)"""
     def __init__(
         self,
         pdf_folder: str,
         index_file: str,
         model_params: dict,
         reserve_tokens: int = 8000,
+        gemini_rotator=None,
     ):
         # Paths
         self.pdf_folder = pdf_folder
         self.index_file = index_file
         
-        # Configure Gemini API
-        if "google_api_key" not in model_params:
-            raise ValueError("model_params['google_api_key'] is required for Gemini API")
-        
-        genai.configure(api_key=model_params["google_api_key"])
+        # Configure Gemini API with first key or rotator
+        self.gemini_rotator = gemini_rotator
+        if self.gemini_rotator:
+            idx, key = self.gemini_rotator.get_next_key()
+            genai.configure(api_key=key)
+            self.current_key_idx = idx
+            masked_key = f"{key[:4]}...{key[-4:]}" if len(key) > 8 else "****"
+            print(f"🚀 [Marsh Thinking] Initialized with Google Gemini API Key #{idx + 1} ({masked_key})")
+        elif "google_api_key" in model_params:
+            key = model_params["google_api_key"]
+            genai.configure(api_key=key)
+            self.current_key_idx = None
+            masked_key = f"{key[:4]}...{key[-4:]}" if len(key) > 8 else "****"
+            print(f"🚀 [Marsh Thinking] Initialized with static Google Gemini API Key ({masked_key})")
+        else:
+            raise ValueError("Either model_params['google_api_key'] or gemini_rotator is required")
         
         # Initialize Gemini model with Gemma 3 12B
         # Using models/gemma-3-12b-it which will use an enhanced manual ReAct loop
@@ -576,13 +657,28 @@ class RAGPipeline:
         
         # Create generative model - NOT using tools parameter for Gemma manual loop
         # Enforce determinism with temperature 0.0
+        # Added safety settings to prevent false positives when analyzing environmental policy/penalties
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+        
         self.llm_client = genai.GenerativeModel(
             model_name=self.model_name,
             generation_config={
+                # ── DETERMINISM LOCK ──────────────────────────────────────────
+                # temperature=0.0 + top_k=1 + top_p=1.0 → pure greedy decoding.
+                # The model ALWAYS picks the single highest-probability token.
+                # This guarantees byte-for-byte identical answers across any
+                # device, browser, OS, or session for the same conversation state.
                 "temperature": 0.0,
-                "top_p": 0.95,
-                "top_k": 40,
-            }
+                "top_p": 1.0,           # disable nucleus sampling
+                "top_k": 1,             # greedy: always pick #1 token
+                "max_output_tokens": 4500,  # allow detailed, comprehensive answers
+            },
+            safety_settings=safety_settings
         )
         
         self.last_retrieved_docs = []
@@ -604,10 +700,14 @@ class RAGPipeline:
         # create relevance checker
         self.relevance_checker = RelevanceChecker(
             embedding_model=self.embedding_model,
-            cross_encoder_name="cross-encoder/ms-marco-MiniLM-L-6-v2",  # best-effort default
-            threshold=0.70,
-            min_docs=2,
-            max_docs=10,
+            cross_encoder_name="cross-encoder/ms-marco-MiniLM-L-6-v2",
+            # Lowered threshold 0.70 → 0.60: don't drop borderline-relevant chunks
+            # that may contain exact policy numbers, penalties, or dates.
+            threshold=0.60,
+            min_docs=3,
+            max_docs=12,
+            # LOCKED False: sentence-level compression uses cosine similarity
+            # comparisons that can reorder in floating-point edge cases → non-deterministic.
             enable_compression=False,
             compression_top_sentences=3
         )
@@ -663,7 +763,8 @@ class RAGPipeline:
     
     def build_index(self, progress_callback=None, status_callback=None):
         """Build index from PDFs in folder"""
-        pdf_files = [f for f in os.listdir(self.pdf_folder) if f.lower().endswith(".pdf")]
+        # Deterministic: sort file names to ensure identical indexing on all machines
+        pdf_files = sorted([f for f in os.listdir(self.pdf_folder) if f.lower().endswith(".pdf")])
         
         if not pdf_files:
             raise ValueError("No PDF files found in folder")
@@ -779,6 +880,11 @@ class RAGPipeline:
             retrievers=[self.faiss_retriever, self.bm25_retriever],
             weights=[0.85, 0.15]
         )
+        
+        # Initialize tool executor
+        from gemini_tools import ToolExecutor
+        self.tool_executor = ToolExecutor(self)
+        logger.info("ToolExecutor initialized for RAGPipeline2")
     
     def _save_index(self):
         """Save index to disk"""
@@ -827,140 +933,512 @@ class RAGPipeline:
             logger.error(f"Failed to load index: {e}")
             return False
     
-    def query(self, question: str, top_k: int = 8) -> str:
+    def _normalize_query(self, question: str) -> str:
+        """
+        Canonical query preprocessing: strips filler words so that semantically
+        identical questions from different typings are normalized before retrieval.
+        Only used for retrieval; the original question is still fed to the LLM.
+        """
+        q = question.strip()
+        # Remove common filler prefixes that add no retrieval signal
+        filler_patterns = [
+            r'^(?:please|kindly)\s+',
+            r'^(?:can you|could you|would you|will you)\s+',
+            r'^(?:tell me|explain|describe|show me|give me|provide)\s+(?:about\s+|me\s+)?',
+            r'^(?:what is|what are|what were|what was)\s+',
+            r'^(?:how does|how do|how can|how to)\s+',
+            r'^(?:i want to know|i need to know|i would like to know)\s+',
+        ]
+        q_lower = q.lower()
+        for pattern in filler_patterns:
+            q_lower = re.sub(pattern, '', q_lower, flags=re.IGNORECASE).strip()
+        # Return the cleaned lowercase version for retrieval queries
+        return q_lower if q_lower else q.lower()
+
+    def _expand_queries(self, question: str) -> List[str]:
+        """
+        Generate multiple canonical phrasings of the same question.
+        This guarantees that semantically identical questions asked in different
+        ways from different users always surface the same chunks via RRF fusion.
+        """
+        base = question.strip()
+        normalized = self._normalize_query(base)
+
+        # Template expansions that cover common rephrasing patterns
+        expansions = [
+            normalized,                                    # normalized base
+            base,                                          # original verbatim
+            f"definition of {normalized}",                 # definitional framing
+            f"{normalized} policy regulations rules",      # policy framing
+            f"{normalized} penalties fines violations",    # enforcement framing
+        ]
+        # Deduplicate while preserving order
+        seen, unique = set(), []
+        for q in expansions:
+            q_stripped = q.strip().lower()
+            if q_stripped and q_stripped not in seen:
+                seen.add(q_stripped)
+                unique.append(q.strip())
+        return unique[:4]  # max 4 to avoid over-retrieval latency
+
+    def _rrf_fuse(self, ranked_lists: List[List[Document]], k: int = 60) -> List[Document]:
+        """
+        Reciprocal Rank Fusion: combine multiple ranked lists of documents.
+        Each document's fused score = sum(1 / (k + rank_i)) across all lists.
+        Deterministic: RRF score is purely arithmetic, no randomness.
+        """
+        scores: Dict[str, Dict] = {}
+        for ranked in ranked_lists:
+            for rank, doc in enumerate(ranked, start=1):
+                key = doc.page_content  # use content as identity
+                if key not in scores:
+                    scores[key] = {'doc': doc, 'score': 0.0}
+                # Use 6 decimal places for RRF arithmetic stability
+                scores[key]['score'] = round(scores[key]['score'] + 1.0 / (k + rank), 6)
+        sorted_items = sorted(scores.values(), key=lambda x: x['score'], reverse=True)
+        return [item['doc'] for item in sorted_items]
+
+    def _expand_and_retrieve(self, question: str, top_k: int = 15) -> List[Document]:
+        """
+        Multi-query retrieval with RRF fusion.
+        Runs retrieval for each query expansion and merges results so that
+        the same document surfaces regardless of how the question was phrased.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        
+        queries = self._expand_queries(question)
+        logger.info(f"Multi-query retrieval: {len(queries)} query variants (Parallel)")
+
+        all_ranked_lists = []
+        unique_queries = list(dict.fromkeys([q.lower() for q in queries])) # dedupe
+        
+        def _get_docs(q):
+            try:
+                msg = f"  Query variant '{q[:60]}'"
+                docs = self.hybrid_retriever.invoke(q)
+                if docs:
+                    logger.info(f"{msg} returned {len(docs)} docs")
+                    return docs
+            except Exception as e:
+                logger.warning(f"Retrieval failed for query variant '{q}': {e}")
+            return []
+
+        # Run retrievals in parallel
+        with ThreadPoolExecutor(max_workers=len(unique_queries)) as executor:
+            results = list(executor.map(_get_docs, unique_queries))
+        
+        all_ranked_lists = [r for r in results if r]
+
+        if not all_ranked_lists:
+            return []
+
+        # Fuse all ranked lists via RRF
+        fused = self._rrf_fuse(all_ranked_lists)
+        logger.info(f"RRF fusion produced {len(fused)} unique docs from {len(all_ranked_lists)} query variants")
+        return fused[:top_k * 3]  # return a generous pool for re-ranking
+
+    def query(self, question: str, top_k: int = 15) -> str:
         """Processes a query and returns the full answer string"""
         if self.hybrid_retriever is None:
             raise ValueError("Index not loaded. Call load_index() or build_index() first.")
-        
+
         # Ensure top_k is int
         try:
             top_k = int(top_k)
         except (ValueError, TypeError):
-            top_k = 8
-            
-        # Initial retrieval for context
-        retrieved_docs = self.hybrid_retriever.invoke(question)
-        top_docs = retrieved_docs[:top_k] if retrieved_docs else []
+            top_k = 15
+
+        # ── STEP 1: Multi-query retrieval with RRF fusion ─────────────────────
+        retrieved_docs = self._expand_and_retrieve(question, top_k=top_k)
+
+        # ── STEP 2: Re-rank fused pool with CrossEncoder ──────────────────────
+        top_docs = retrieved_docs[:top_k * 2] if retrieved_docs else []
         filtered = self.relevance_checker.filter_documents(question, top_docs)
         filtered_docs = [d for d, s in filtered]
 
         # Capture filtered_docs for UI references
         self.last_retrieved_docs = filtered_docs
 
-        # Generate full answer
-        full_answer = self._generate_answer(question, filtered_docs)
-            
+        # ── STEP 3: Generate answer via deep research ReAct loop ──────────────
+        # Detect informative intent keywords in the question
+        informative_keywords = [
+            "informative answer", "informative", "explain in detail", "in detail",
+            "comprehensive", "elaborate", "describe", "give details", "detailed"
+        ]
+        q_lower = question.lower()
+        is_informative = any(kw in q_lower for kw in informative_keywords)
+
+        if is_informative:
+            augmented_question = (
+                f"[RESEARCH DIRECTIVE: Provide a comprehensive, informative answer of 200-300 words. "
+                f"Use structured headings, bullets with explanations, tables where relevant, and cite all sources.] "
+                f"{question}"
+            )
+        else:
+            augmented_question = question
+
+        full_answer = self._generate_answer(augmented_question, filtered_docs)
+
         # Store this exchange in history once complete
         self.conversation_manager.add_exchange(question, full_answer.strip())
-        
+
         # Log conversation stats
         stats = self.conversation_manager.get_stats()
         logger.info(f"Query complete. Total exchanges: {stats['total_exchanges']}")
         return full_answer
 
+
+    def set_history(self, messages: List[Dict[str, str]]):
+        """Synchronize conversation history"""
+        self.conversation_manager.set_history(messages)
+
     def _generate_answer(self, question: str, context_docs: List[Document]) -> str:
-        """Generates answer using the Enhanced Manual ReAct Loop (Non-streaming)"""
-        
-        system_prompt = f"""You are 'Marsh Warden', an elite AI research assistant specializing in wetland conservation and policy in Sri Lanka. 
-Your mission is to provide extremely accurate, evidence-based answers using the provided tools.
+        """Generates answer using the Enhanced Manual ReAct Loop — Deep Research Mode (Non-streaming)"""
 
-CORE PRINCIPLES:
-1. RIGOROUS SEARCH: Always use the retrieval tools to verify facts before answering.
-2. SOURCE CONSISTENCY: Cross-reference findings across multiple documents to ensure accuracy.
-3. STRICT ADHERENCE: Only provide information found in the documents. If a conflict arises, prioritize the most recent or relevant policy document.
-4. DETAILED SYNTHESIS: Provide comprehensive answers that capture nuances from multiple sources.
+        FEW_SHOT_EXAMPLE = """
+Example Reasoning Cycle:
+Question: What are the specific protection rules for the Muturajawela wetland?
+Thought: I need to check the document list first to find the right document, then search within it.
+Action: get_document_list({})
+Observation: [get_document_list]: Available documents:
+- National Wetland Policy: 156 chunks, 24 pages
+- Muturajawela Management Plan: 88 chunks, 12 pages
+Reflection: Confidence=4/10. I found the relevant doc. Searching now for protection rules within it.
+Action: search_specific_document({"document_name": "Muturajawela Management Plan", "query": "protection rules conservation regulations zones"})
+Observation: [search_specific_document]: SOURCE 1: Muturajawela Management Plan (Page 4) | Relevance: HIGH
+Content: Section 2.1: Zone A is strictly protected. No construction or landfilling is allowed...
+Reflection: Confidence=7/10. Found key rules. I must verify the key numerical/regulatory fact before final answer.
+Action: verify_answer({"statement": "Zone A of Muturajawela prohibits construction and landfilling", "source_hint": "Muturajawela Management Plan"})
+Observation: [verify_answer]: Verdict: SUPPORTED | Confidence: 9/10
+Reflection: Confidence=9/10. Verified. Ready to write Final Answer with citations.
+Final Answer:
+According to the **Muturajawela Management Plan** (p. 4):
+- **Zone A** is strictly protected — construction and landfilling are prohibited [Muturajawela Management Plan, p. 4]
 
-TOOLS AVAILABLE:
-1. retrieve_documents(query: str, top_k: int = 15)
-2. search_specific_document(document_name: str, query: str)
-3. get_document_list()
+**Sources Used:**
+- Muturajawela Management Plan, p. 4
+"""
 
-ENHANCED REACT FORMAT:
-You must strictly follow this reasoning cycle:
-Thought: [Reasoning - evaluate if current information is sufficient or needs more research]
+        # ── DEEP RESEARCH SYSTEM PROMPT — ADAPTIVE MODE ────────────────────
+        system_prompt = f"""You are 'Marsh Thinking', an elite AI research assistant specializing in Sri Lankan wetland conservation.
+Your SINGLE most important duty is ACCURACY followed by ADAPTIVE VERBOSITY. You must deliver answers that match the user's specific intent while remaining 100% grounded in the knowledge base.
+
+═══════════════════════════════════════════════════════════════
+DEEP RESEARCH PROTOCOL — FOLLOW EXACTLY
+═══════════════════════════════════════════════════════════════
+1. START: Call get_document_list first when unsure which document to target.
+2. MULTI-HOP: Run at least 2-3 targeted searches. Never answer from a single retrieval.
+3. SPECIFICITY: Search for exact terms — Act numbers, section numbers, Rs. amounts, year enacted.
+4. INTENT & STRUCTURE: After gathering evidence, call **plan_answer_structure**.
+   - If the question contains keywords like "informative answer", "explain", "comprehensive", "in detail" → set identified_intent="Informative", target_word_count="200-300".
+   - Otherwise → identify the user's actual intent (Direct or Informative) and set word count accordingly.
+5. VERIFY: Before Final Answer, call **verify_answer** for every key numerical/legal/policy fact.
+6. SELF-CRITIQUE: After 4+ tool calls, list confirmed facts vs. remaining gaps before Final Answer.
+
+═══════════════════════════════════════════════════════════════
+OUTPUT FORMAT — ADAPTIVE ARCHITECTURE
+═══════════════════════════════════════════════════════════════
+- **INTENT-DRIVEN LENGTH**:
+  - **Direct Intent**: Generate a precise, factual answer. Target **50-150 words**. Use for simple "What is X" or "How much is Y" questions.
+  - **Informative Intent** (triggered by keywords: informative answer, explain, comprehensive, in detail, describe, elaborate): Generate a comprehensive, multi-faceted analysis with headings, bullets with explanations, and tables. Target **200-300 words**.
+- **NO FIXED TEMPLATE**: Implement the custom layout you designed with `plan_answer_structure`.
+- **VISUAL AIDS**: Use **TABLES** for comparing numerical data, penalties, or regulatory zones.
+- **DESCRIPTIVE BULLETS**: Use **BULLET POINTS** for listing features, but follow every bullet with 2-3 sentences of explanation in Informative mode.
+- **BOLDING**: **Bold** all key terms: **Act Name**, **penalty amount**, **section number**, **date**.
+- **CITATIONS**: Every factual claim MUST end with its source: [Document Name, Page X].
+
+FORMAT for reasoning:
+Thought: [What information do I need and why?]
 Action: tool_name({{"arg": "val"}})
-Observation: [Result]
-Reflection: [Evaluate findings and check for internal consistency]
+Observation: [Tool result]
+Reflection: [Confidence=X/10. What did I learn? What is still missing?]
 ...
-Final Answer: [Synthesize the detailed response with exact citations]
+SELF-CRITIQUE (after 4+ iterations): [Confirmed facts | Remaining gaps | Next action]
+...
+Final Answer:
+[Accurate, intent-aware answer using your APPROVED STRUCTURE and TARGET WORD COUNT — every claim has [Source, Page]]
 
+**Sources Used:**
+- [Document, pages]
+
+{FEW_SHOT_EXAMPLE}
 Begin!
 """
-        
+
         history = self.conversation_manager.get_history()
         full_context = f"SYSTEM: {system_prompt}\n\n"
         for msg in history:
             role = "USER" if msg["role"] == "user" else "ASSISTANT"
             full_context += f"{role}: {msg['content']}\n"
         full_context += f"USER: {question}\n"
-        
+
         current_prompt = full_context
-        max_iterations = 7
+        max_iterations = 15          # raised back to 15
         iteration = 0
         last_action = None
-        
+        tool_call_count = 0
+        self_critique_done = False
+
         try:
             while iteration < max_iterations:
                 iteration += 1
-                logger.info(f"ReAct Iteration {iteration}")
+                logger.info(f"ReAct Iteration {iteration}/{max_iterations} for {self.model_name}")
+
+                # ── Inject mandatory self-critique after 4+ tool calls ──────────
+                if tool_call_count >= 4 and not self_critique_done:
+                    self_critique_done = True
+                    current_prompt += (
+                        "\nSYSTEM INTERRUPT: You have made 4+ tool calls. "
+                        "Write a SELF-CRITIQUE before continuing:\n"
+                        "- List each confirmed fact with its source name [Source]\n"
+                        "- List what is still missing (e.g. specific penalty values, dates)\n"
+                        "- State your next specific research goal.\n"
+                        "SELF-CRITIQUE: "
+                    )
+
+                # ── Final Call Nudge (Iteration 13) ───────────────────────────
+                if iteration == 13:
+                    current_prompt += (
+                        "\nSYSTEM FINAL CALL: You are reaching the research limit. "
+                        "Synthesize all gathered information now. If enough info exists, "
+                        "write your Final Answer with full citations. If not, state what is missing.\n"
+                    )
+
+                # Call model with automatic rotation on quota limits
+                full_llm_output = ""
+                try:
+                    full_llm_output = self._safe_generate_content(current_prompt)
+                except Exception as e:
+                    logger.error(f"Failed to generate content after rotation attempts: {e}")
+                    return (
+                        f"I encountered an error during research: {str(e)}. "
+                        "This may happen if the content is flagged as sensitive or there is a connection issue."
+                    )
                 
-                # Call model without streaming
-                response = self.llm_client.generate_content(current_prompt)
-                full_llm_output = response.text
+                if not full_llm_output:
+                    return "I'm sorry, I couldn't generate a response. Please try again."
                 
-                # Detection logic (Case-insensitive)
+                logger.info(f"Model response received ({len(full_llm_output)} chars)")
+
                 lower_output = full_llm_output.lower()
-                
-                if "final answer:" in lower_output:
-                    # Find the marker and return everything after it
-                    marker_match = re.search(r"final answer:", full_llm_output, re.IGNORECASE)
+
+                # ── Final Answer detection ──────────────────────────────────────
+                if "final answer" in lower_output:
+                    marker_match = re.search(r"final answer:?", full_llm_output, re.IGNORECASE)
                     if marker_match:
-                        return full_llm_output[marker_match.end():].strip()
-                    return full_llm_output.strip()
-                
-                if "action:" in lower_output:
-                    # Parse tool call
-                    action_match = re.search(r"action:\s*(\w+)\((.*)\)", full_llm_output, re.IGNORECASE | re.DOTALL)
+                        ans = full_llm_output[marker_match.end():].strip()
+                        if ans:
+                            logger.info(f"Final Answer found at iteration {iteration}")
+                            return self._strip_react_trace(ans)
+
+                # ── Fallback: direct output in later iterations ─────────────────
+                if iteration >= 7 and not any(
+                    m in lower_output for m in ["action:", "thought:", "reflection:", "self-critique"]
+                ):
+                    if len(full_llm_output) > 100:
+                        logger.info("Assuming direct output is Final Answer (no markers, iter>=7).")
+                        return self._strip_react_trace(full_llm_output.strip())
+
+                # ── Tool call detection ─────────────────────────────────────────
+                if "action" in lower_output:
+                    # 1. Try strict end-anchored match first
+                    action_match = re.search(
+                        r"action:?\s*(\w+)\s*\((.*?)\)\s*$",
+                        full_llm_output,
+                        re.IGNORECASE | re.DOTALL | re.MULTILINE
+                    )
+                    # 2. Try greedy fallback if strict fails
+                    if not action_match:
+                        action_match = re.search(
+                            r"action:?\s*(\w+)\s*\((.*)\)",
+                            full_llm_output,
+                            re.IGNORECASE | re.DOTALL
+                        )
+
                     if action_match:
                         tool_name = action_match.group(1).strip()
                         args_str = action_match.group(2).strip()
-                        
+                        observation = ""
+
                         try:
-                            # Clean potential markdown or extra text around JSON
-                            args_json = args_str
-                            if '```' in args_json:
-                                json_match = re.search(r'(\{.*\})', args_json, re.DOTALL)
-                                if json_match:
-                                    args_json = json_match.group(1)
-                            
-                            tool_args = json.loads(args_json)
-                            current_action = f"{tool_name}({args_json})"
-                            
+                            # ── Smart Argument Parsing (Handles JSON and Python-style) ─────
+                            tool_args = {}
+                            try:
+                                clean_json = args_str
+                                if '```' in clean_json:
+                                    json_match = re.search(r'(\{.*\})', clean_json, re.DOTALL)
+                                    if json_match: clean_json = json_match.group(1)
+                                tool_args = json.loads(clean_json or "{}")
+                            except (json.JSONDecodeError, ValueError):
+                                # Fallback: Extract key-value pairs
+                                logger.warning(f"JSON parse failed for args: {args_str}. Trying regex fallback.")
+                                kv_pairs = re.findall(r'(\w+)\s*=\s*(?:"(.*?)"|\'(.*?)\'|(\d+))', args_str)
+                                for k, v1, v2, v3 in kv_pairs:
+                                    val = v1 or v2 or v3
+                                    if v3: val = int(v3)
+                                    tool_args[k] = val
+                                if not tool_args and args_str:
+                                    tool_args = {"query": args_str.strip('"\')} ')}
+
+                            current_action = f"{tool_name}({tool_args})"
+
                             if current_action == last_action:
-                                observation = "Error: You already performed this action. Try a different approach or conclude."
+                                observation = (
+                                    "Error: You already performed this exact action. "
+                                    "Try a different phrasing, call get_document_list, "
+                                    "or write your Final Answer."
+                                )
                             else:
                                 last_action = current_action
+                                tool_call_count += 1
                                 try:
                                     tool_result = self.tool_executor.execute_tool(tool_name, tool_args)
                                     observation = format_tool_result_for_prompt(tool_name, tool_result)
+                                    
+                                    if ("No relevant documents found" in observation 
+                                        or "No content found" in observation):
+                                        observation += (
+                                            "\n[System Hint]: No results. Try broader keywords or check document names."
+                                        )
                                 except Exception as e:
-                                    observation = f"Error: {str(e)}"
+                                    observation = f"Error executing tool {tool_name}: {str(e)}"
                         except Exception as e:
-                            observation = f"Error parsing arguments: {str(e)}"
-                        
-                        # Update prompt with tool result
-                        current_prompt += f"\n{full_llm_output}\nObservation: {observation}\nReflection: Based on this, I should..."
+                            logger.error(f"Action processing failed: {e}")
+                            observation = f"Error: Could not process arguments '{args_str}'."
+
+                        current_prompt += f"\n{full_llm_output}\nObservation: {observation}\n"
                         continue
-                
-                # If no marker is found but we still have iterations, 
-                # give the model a hint to conclude or call a tool
-                current_prompt += f"\n{full_llm_output}\nThought: I should continue my research or provide a Final Answer."
-                
-            return "I encountered complexity while researching. Please be more specific."
-            
+
+                # No recognized marker — nudge the model ──────────────────────
+                current_prompt += (
+                    f"\n{full_llm_output}\n"
+                    "Thought: I have not yet provided a Final Answer or called a tool correctly. "
+                    "I must proceed with the next step in the ReAct cycle."
+                )
+
+            return (
+                "The analysis required more steps than available. "
+                "Please try a more specific question or break it into smaller parts."
+            )
+
         except Exception as e:
             logger.error(f"Generation error: {e}")
             return f"Error: {str(e)}"
+
+    def _safe_generate_content(self, prompt: str, max_retries: int = 5) -> str:
+        """Helper to generate content with automatic API key rotation on quota limits and empty response handling"""
+        retries = 0
+        while retries < max_retries:
+            try:
+                response = self.llm_client.generate_content(prompt)
+                
+                # Check for empty response or safety blocks
+                if not response:
+                    logger.warning("Empty response object received from Gemini.")
+                    return "I'm sorry, I cannot provide an answer due to an empty model response."
+                
+                # Success - mark key as successful if using rotator
+                if self.gemini_rotator is not None and self.current_key_idx is not None:
+                    self.gemini_rotator.mark_key_success(self.current_key_idx)
+                
+                # Safely extract text (Gemini raises ValueError if parts are empty even on finish_reason=1)
+                try:
+                    return response.text
+                except ValueError as ve:
+                    logger.warning(f"Gemini returned no text parts (finish_reason={getattr(response.candidates[0], 'finish_reason', 'unknown') if response.candidates else 'none'}). Error: {ve}")
+                    raise Exception("Empty response from API (ValueError on text accessor)")
+                
+            except Exception as e:
+                error_str = str(e)
+                # Check for quota/rate limit errors (429) or service unavailable (503/500)
+                is_retryable = (
+                    "429" in error_str or 
+                    "503" in error_str or 
+                    "500" in error_str or
+                    "quota" in error_str.lower() or 
+                    "limit" in error_str.lower() or
+                    "unavailable" in error_str.lower() or
+                    "empty response" in error_str.lower()
+                )
+                
+                if is_retryable and self.gemini_rotator:
+                    msg = f"⚠️ [Marsh Thinking] API error hit for Gemini Key #{self.current_key_idx + 1}: {error_str}. Rotating key..."
+                    print(f"\n{msg}")
+                    logger.warning(msg)
+                    
+                    # Mark current key as failed (temporary)
+                    if self.current_key_idx is not None:
+                        self.gemini_rotator.mark_key_failed(self.current_key_idx)
+                    
+                    # Get next key and reconfigure
+                    idx, key = self.gemini_rotator.get_next_key()
+                    genai.configure(api_key=key)
+                    self.current_key_idx = idx
+                    
+                    masked_key = f"{key[:4]}...{key[-4:]}" if len(key) > 8 else "****"
+                    print(f"🔃 [Marsh Thinking] Switched to Google Gemini API Key #{idx + 1} ({masked_key})")
+                    
+                    # Re-initialize the model with the new key (keep deterministic settings)
+                    safety_settings = [
+                        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                    ]
+                    self.llm_client = genai.GenerativeModel(
+                        model_name=self.model_name,
+                        generation_config={
+                            "temperature": 0.0,
+                            "top_p": 1.0,
+                            "top_k": 1,
+                            "max_output_tokens": 4500,
+                        },
+                        safety_settings=safety_settings
+                    )
+                    
+                    retries += 1
+                    continue
+                else:
+                    # Some other non-quota error
+                    logger.error(f"Unexpected error in _safe_generate_content: {e}")
+                    raise e
+        
+        raise Exception("Exceeded max retries for Gemini API key rotation")
+
+    @staticmethod
+    def _strip_react_trace(text: str) -> str:
+        """Remove any leaked ReAct chain-of-thought from the answer before returning it to the caller.
+        Priority:
+          1. If 'Final Answer:' appears inside the text (model repeated it), extract only what follows.
+          2. Strip leading/trailing lines that start with ReAct keywords.
+        """
+        import re as _re
+        # Pass 1 — if the model accidentally included another 'Final Answer:' marker, keep only what follows
+        fa_match = _re.search(r"final answer:?", text, _re.IGNORECASE)
+        if fa_match:
+            candidate = text[fa_match.end():].strip()
+            if candidate:
+                text = candidate
+
+        # Pass 2 — strip lines that start with known ReAct prefixes
+        react_prefixes = (
+            "thought:", "action:", "observation:", "reflection:",
+            "self-critique:", "system interrupt:", "[system hint]",
+        )
+        clean_lines = []
+        skip = False
+        for line in text.splitlines():
+            low = line.strip().lower()
+            if any(low.startswith(p) for p in react_prefixes):
+                skip = True
+                continue
+            if skip and low == "":
+                skip = False
+                continue
+            if not skip:
+                clean_lines.append(line)
+        result = "\n".join(clean_lines).strip()
+        return result if result else text.strip()
 
     def _generate_answer_with_history(self, question: str, context_docs: List[Document]) -> str:
         """Standard non-streaming generation"""
@@ -1072,8 +1550,8 @@ if __name__ == "__main__":
         "deepseek_model": "deepseek-ai/DeepSeek-R1:novita",
     }
 
-    print("[MAIN] Initializing RAGPipeline...")
-    pipeline = RAGPipeline(
+    print("[MAIN] Initializing RAGPipeline2...")
+    pipeline = RAGPipeline2(
         pdf_folder=PDF_FOLDER,
         index_file=INDEX_FILE,
         model_params=model_params,
@@ -1203,3 +1681,4 @@ def debug_print_chunks_for_source(documents, source_name: str, max_chunks: int =
     # print("\n[MAIN] Debug: chunks for Rao-2018-Power_from_agro-waste-Business_Model_6.pdf")
     # pipeline.debug_print_chunks_for_source("Rao-2018-Power_from_agro-waste-Business_Model_6.pdf",
     #                                        max_chunks=20)
+

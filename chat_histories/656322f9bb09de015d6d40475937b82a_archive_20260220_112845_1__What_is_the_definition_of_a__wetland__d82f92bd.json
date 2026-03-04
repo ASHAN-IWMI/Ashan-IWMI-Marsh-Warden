@@ -1,0 +1,18 @@
+{
+  "user_email": "guest@local",
+  "timestamp": "2026-02-20T11:28:45.981972",
+  "title": "1.\tWhat is the definition of a 'wetland' according to Sri...",
+  "messages": [
+    {
+      "role": "user",
+      "content": "1.\tWhat is the definition of a 'wetland' according to Sri Lankan policy?"
+    },
+    {
+      "role": "user",
+      "content": "What is the definition of a 'wetland' according to Sri Lankan policy?"
+    },
+    {
+      "role": "assistant",
+      "content": "According to Sri Lankan policy, the definition of a 'wetland' is not explicitly codified in a single, legally binding document. The National Wetland Policy (p. 3) provides a guiding definition: \"Wetland\" means areas of marsh, fen, peatland or waters, whether still or flowing, permanently or periodically wet, including areas of tidal flats, mangroves, salt flats, intertidal areas, and similar ecosystems. This definition is consistent with the Ramsar Convention on Wetlands. However, the National Wetland Policy itself is not legally binding. The Coastal Resources Management Act (p. 5) provides a more legally grounded definition: \"Wetland\" means any area of land saturated by water, permanently or periodically, which gives rise to vegetation and soils adapted to life in water or wet conditions. This includes, but is not limited to, mangroves, salt marshes, lagoons, estuaries, and coral reefs. Therefore, the Coastal Resources Management Act's definition is currently considered the most authoritative legal definition of 'wetland' in Sri Lanka.",
+      "references": [
+        

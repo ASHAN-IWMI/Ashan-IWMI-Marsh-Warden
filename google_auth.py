@@ -4,6 +4,7 @@ from urllib.parse import urlencode
 from uuid import uuid4
 import time
 import json
+import hashlib
 import os
 
 # Color palette
@@ -275,11 +276,16 @@ def check_google_auth():
     params = st.query_params
 
     # DEBUG: Print initialization
-    print(f"🔍 DEBUG - Auth Check Started")
+    print(f"[DEBUG] Auth Check Started")
     print(f"   redirect_uri loaded: {google_oauth.redirect_uri}")
     print(f"   query_params: {params}")
 
     # ========== HANDLE GUEST LOGIN ==========
+    # Check for persistent model in query params first
+    url_model = params.get("selected_model")
+    if url_model:
+        st.session_state.model = url_model
+    
     # Check for persistent guest_session param FIRST (survives refresh)
     guest_session_val = params.get("guest_session")
     if guest_session_val:
@@ -287,23 +293,30 @@ def check_google_auth():
         st.session_state.guest_session_id = guest_session_val
         st.session_state.google_user = {"name": "Guest", "email": "guest@local", "picture": ""}
         return True
+    
     # Then check session state (within same browser session)
     if st.session_state.get("guest_authenticated"):
         return True
+    
     # Initial guest login - set persistent param
     if params.get("guest") == "1" or params.get("guest") == ["1"]:
+        # Use provided model or default to 'Marsh Fast'
+        selected_model = params.get("selected_model") or "Marsh Fast"
+            
+        st.session_state.model = selected_model
         st.session_state.guest_authenticated = True
         st.session_state.google_user = {"name": "Guest", "email": "guest@local", "picture": ""}
         session_id = uuid4().hex
         st.session_state.guest_session_id = session_id
         st.query_params.clear()
         st.query_params["guest_session"] = session_id
+        st.query_params["selected_model"] = selected_model
         st.rerun()
         return True
 
     # ========== HANDLE OAUTH CALLBACK ==========
     if "code" in params:
-        print(f"✅ OAuth callback detected - code present in params")
+        print(f"[AUTH] OAuth callback detected - code present in params")
         code = params["code"]
         print(f"   code: {code[:30]}...")
         
@@ -345,15 +358,15 @@ def check_google_auth():
         """, unsafe_allow_html=True)
         
         # Get tokens
-        print(f"🔄 Exchanging code for tokens...")
+        print(f"[AUTH] Exchanging code for tokens...")
         tokens = google_oauth.get_tokens(code)
         
         if tokens and "access_token" in tokens:
-            print(f"✅ Tokens received, fetching user info...")
+            print(f"[AUTH] Tokens received, fetching user info...")
             user_info = google_oauth.get_user_info(tokens["access_token"])
             
             if user_info:
-                print(f"✅ User info received: {user_info.get('email')}")
+                print(f"[AUTH] User info received: {user_info.get('email')}")
                 
                 # Store in session state
                 st.session_state.google_authenticated = True
@@ -367,11 +380,11 @@ def check_google_auth():
                     st.session_state.token_expires_at = tokens['expires_at']
                 
                 # Save to persistent file
-                print(f"💾 Saving tokens to file...")
+                print(f"[AUTH] Saving tokens to file...")
                 save_tokens_to_file(tokens, user_info)
                 
                 # --- MODIFIED: Set Session ID in URL instead of JS Redirect ---
-                print(f"🧹 Setting session ID in URL...")
+                print(f"[AUTH] Setting session ID in URL...")
                 
                 # Calculate session hash
                 email = user_info.get("email")
@@ -383,20 +396,24 @@ def check_google_auth():
                 # Set the session param so reload works
                 st.query_params["session"] = session_hash
                 
+                # Persist model selection through redirect if it exists in session state
+                if "model" in st.session_state:
+                    st.query_params["selected_model"] = st.session_state.model
+                
                 # Rerun to update URL
                 st.rerun()
                 return True
             else:
-                print(f"❌ Failed to get user info")
+                print(f"[ERROR] Failed to get user info")
         else:
-            print(f"❌ Failed to exchange code for tokens")
+            print(f"[ERROR] Failed to exchange code for tokens")
         
-        st.error("❌ Authentication failed. Please try again.")
+        st.error("Authentication failed. Please try again.")
         return False
 
     # ========== CHECK SESSION STATE ==========
     if st.session_state.get("google_authenticated"):
-        print(f"✅ User already in session state")
+        print(f"[AUTH] User already in session state")
         
         # --- ADDED: Ensure URL has session ID ---
         user_info = st.session_state.get("google_user")
@@ -408,18 +425,18 @@ def check_google_auth():
         
         session_start = st.session_state.get("session_start_time")
         if session_start and (time.time() - session_start) < (2 * 60 * 60):
-            print(f"✅ Session still valid")
+            print(f"[AUTH] Session still valid")
             return True
         else:
-            print(f"⏰ Session expired - logging out")
+            print(f"[AUTH] Session expired - logging out")
             logout()
             return False
 
     # ========== CHECK PERSISTENT STORAGE ==========
-    print(f"🔍 Checking persistent storage...")
+    print(f"[AUTH] Checking persistent storage...")
     stored_auth = load_tokens_from_file()
     if stored_auth:
-        print(f"✅ Found stored tokens - restoring...")
+        print(f"[AUTH] Found stored tokens - restoring...")
         tokens = stored_auth["tokens"]
         user_info = stored_auth["user_info"]
         
@@ -440,199 +457,186 @@ def check_google_auth():
         if st.query_params.get("session") != session_hash:
             st.query_params["session"] = session_hash
         
-        print(f"✅ Restored from storage")
+        print(f"[AUTH] Restored from storage")
         return True
 
     # ========== SHOW LOGIN PAGE ==========
-    print(f"📝 No authentication found - showing login page")
+    print(f"[AUTH] No authentication found - showing login page")
     if not st.session_state.get("google_authenticated"):
-        auth_url = google_oauth.get_authorization_url()
-        print(f"   Auth URL: {auth_url[:100]}...")
-        show_login_page(auth_url)
+        show_login_page(google_oauth)
         return False
 
     return False
 
-def show_login_page(auth_url):
-    """Display the beautiful login page"""
-    st.markdown(
-        f"""
-        <style>
-        @keyframes fadeInUp {{
-            from {{
-                opacity: 0;
-                transform: translateY(30px);
+def show_login_page(google_oauth):
+    """Display the beautiful login page with model selection"""
+    
+    # State initialization
+    if "pre_login_model" not in st.session_state:
+        st.session_state.pre_login_model = "Marsh Fast"
+    if "model" not in st.session_state:
+        st.session_state.model = "Marsh Fast"
+
+    st.markdown('<div style="margin-top: 50px;"></div>', unsafe_allow_html=True)
+
+    # Centered container
+    col1, col2, col3 = st.columns([1.5, 1, 1.5])
+
+    with col2:
+        # Inject global CSS
+        st.markdown(
+            f"""
+            <style>
+            /* === PAGE BACKGROUND === */
+            .stApp {{
+                background: #f0faf8 !important;
             }}
-            to {{
-                opacity: 1;
-                transform: translateY(0);
+
+            /* === 3D CONTAINER STYLING (targets st.container border wrapper) === */
+            @keyframes floatBox {{
+                0%, 100% {{
+                    transform: perspective(1000px) rotateX(1.8deg) rotateY(-0.5deg) translateY(0px);
+                    box-shadow:
+                        0 2px 0px rgba(255,255,255,0.9) inset,
+                        0 -4px 0px rgba(13,148,136,0.12) inset,
+                        4px 0 0px rgba(45,212,191,0.2) inset,
+                        -4px 0 0px rgba(13,148,136,0.05) inset,
+                        0 15px 45px rgba(0,0,0,0.06),
+                        0 4px 15px rgba(45,212,191,0.15);
+                }}
+                50% {{
+                    transform: perspective(1000px) rotateX(-1.5deg) rotateY(0.5deg) translateY(-8px);
+                    box-shadow:
+                        0 3px 0px rgba(255,255,255,0.9) inset,
+                        0 -5px 0px rgba(13,148,136,0.15) inset,
+                        5px 0 0px rgba(45,212,191,0.25) inset,
+                        -5px 0 0px rgba(13,148,136,0.08) inset,
+                        0 40px 80px rgba(0,0,0,0.1),
+                        0 12px 35px rgba(45,212,191,0.25);
+                }}
             }}
-        }}
-        
-        @keyframes shimmer {{
-            0% {{
-                background-position: -1000px 0;
+
+            div[data-testid="stVerticalBlockBorderWrapper"] {{
+                border-radius: 28px !important;
+                border-top: 1.5px solid rgba(45,212,191,0.4) !important;
+                border-left: 1.5px solid rgba(45,212,191,0.3) !important;
+                border-right: 1px solid rgba(13,148,136,0.1) !important;
+                border-bottom: 3.5px solid rgba(13,148,136,0.3) !important;
+                background: #ffffff !important;
+                padding: 36px 32px 28px 32px !important;
+                animation: floatBox 6s ease-in-out infinite !important;
+                transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275), 
+                            box-shadow 0.4s ease,
+                            border-color 0.4s ease !important;
+                overflow: visible !important;
             }}
-            100% {{
-                background-position: 1000px 0;
+
+            div[data-testid="stVerticalBlockBorderWrapper"]:hover {{
+                transform: perspective(1000px) rotateX(0deg) rotateY(0deg) translateY(-6px) scale(1.01) !important;
+                border-color: rgba(45,212,191,0.6) !important;
+                box-shadow: 
+                    0 40px 80px rgba(0,0,0,0.12),
+                    0 10px 30px rgba(45,212,191,0.35),
+                    0 0 20px rgba(45,212,191,0.2) !important;
             }}
-        }}
-        
-        @keyframes float {{
-            0%, 100% {{
-                transform: translateY(0px);
+
+            /* === SIGN IN BUTTON === */
+            .google-btn {{
+                background: linear-gradient(135deg, #07996c 0%, #059669 100%) !important;
+                color: white !important;
+                padding: 14px 24px;
+                border-radius: 14px;
+                font-weight: 700;
+                font-size: 15px;
+                text-decoration: none !important;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                margin-bottom: 14px;
+                box-shadow: 0 4px 12px rgba(7, 153, 108, 0.3);
+                transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                width: 100%;
             }}
-            50% {{
-                transform: translateY(-10px);
+            .google-btn:hover {{
+                transform: translateY(-4px) scale(1.02);
+                box-shadow: 0 12px 30px rgba(7, 153, 108, 0.45);
             }}
-        }}
-        
-        .stApp {{
-            background: linear-gradient(135deg, #F0FDFA 0%, #CCFBF1 100%);
-        }}
-        
-        .login-card {{
-            max-width: 420px;
-            margin: 80px auto;
-            padding: 50px 40px;
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 10px 40px rgba(15, 118, 110, 0.1);
-            text-align: center;
-            animation: fadeInUp 0.6s ease-out;
-            position: relative;
-            overflow: hidden;
-        }}
-        
-        .login-card::before {{
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(6, 182, 212, 0.1), transparent);
-            animation: shimmer 3s infinite;
-        }}
-        
-        .login-card:hover {{
-            transform: translateY(-5px);
-            box-shadow: 0 15px 50px rgba(15, 118, 110, 0.15);
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        }}
-        
-        .icon-wrapper {{
-            display: inline-block;
-            font-size: 48px;
-            margin-bottom: 20px;
-            animation: float 3s ease-in-out infinite;
-        }}
-        
-        .login-title {{
-            font-size: 32px;
-            font-weight: 700;
-            background: linear-gradient(135deg, {PRIMARY_COLOR} 0%, {SECONDARY_COLOR} 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            margin-bottom: 8px;
-            animation: fadeInUp 0.6s ease-out 0.2s both;
-        }}
-        
-        .login-subtitle {{
-            color: {TEXT_SECONDARY};
-            font-size: 16px;
-            margin-bottom: 40px;
-            animation: fadeInUp 0.6s ease-out 0.4s both;
-        }}
-        
-        .google-btn {{
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            background: linear-gradient(135deg, {PRIMARY_COLOR} 0%, {ACCENT_COLOR} 100%);
-            color: white;
-            padding: 14px 36px;
-            font-size: 16px;
-            font-weight: 600;
-            border-radius: 12px;
-            text-decoration: none;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            position: relative;
-            overflow: hidden;
-            box-shadow: 0 4px 15px rgba(15, 118, 110, 0.3);
-            animation: fadeInUp 0.6s ease-out 0.6s both;
-        }}
-        
-        .google-btn::before {{
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-            transition: left 0.5s;
-        }}
-        
-        .google-btn:hover::before {{
-            left: 100%;
-        }}
-        
-        .google-btn:hover {{
-            transform: translateY(-2px) scale(1.02);
-            box-shadow: 0 6px 25px rgba(15, 118, 110, 0.4);
-        }}
-        
-        .google-btn:active {{
-            transform: translateY(0) scale(0.98);
-        }}
-        
-        .google-icon {{
-            width: 20px;
-            height: 20px;
-            margin-right: 10px;
-        }}
-        
-        .security-badge {{
-            margin-top: 30px;
-            padding: 12px 20px;
-            background: {BACKGROUND_LIGHT};
-            border-radius: 10px;
-            font-size: 13px;
-            color: {TEXT_SECONDARY};
-            animation: fadeInUp 0.6s ease-out 0.8s both;
-        }}
-        
-        .security-icon {{
-            color: {ACCENT_COLOR};
-            margin-right: 6px;
-        }}
-        
-        #MainMenu {{visibility: hidden;}}
-        footer {{visibility: hidden;}}
-        .stDeployButton {{display: none !important;}}
-        </style>
-        <div class="login-card">
-            <div class="icon-wrapper">🔐</div>
-            <div class="login-title">Marsh Warden</div>
-            <div class="login-subtitle">Wetland Information & Conservation Policy support Assistant - Sri Lanka</div>
-            <a href="{auth_url}" class="google-btn">
-                <svg class="google-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                    <path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-                    <path fill="#fff" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-                    <path fill="#fff" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-                    <path fill="#fff" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-                </svg>
-                Sign in with Google
-            </a>
-            <a href="?guest=1" style="display:block; margin-top:20px; color:{TEXT_SECONDARY}; font-size:14px; text-decoration:none;">Login as Guest</a>
-            <div style="font-size:11px; color:#94a3b8; margin-top:4px;">Guest sessions are temporary</div>
-            <div class="security-badge">
-                <span class="security-icon">🛡️</span>
-                Secure OAuth 2.0 Authentication • 2-Hour Session
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            .google-btn:active {{
+                transform: translateY(-1px) scale(0.98);
+            }}
+
+            /* === GUEST BUTTON === */
+            .guest-btn {{
+                background: white !important;
+                color: #555 !important;
+                padding: 11px 24px;
+                border-radius: 50px;
+                font-weight: 500;
+                font-size: 14px;
+                text-decoration: none !important;
+                display: block;
+                border: 1.5px solid #f99 !important;
+                margin-bottom: 24px;
+                width: 100%;
+                text-align: center;
+                transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            }}
+            .guest-btn:hover {{
+                background: #f0faf8 !important;
+                transform: translateY(-3px) scale(1.02);
+                box-shadow: 0 8px 20px rgba(45, 212, 191, 0.15);
+                border-color: #2dd4bf !important;
+                color: #0d9488 !important;
+            }}
+            .guest-btn:active {{
+                transform: translateY(-1px) scale(0.98);
+            }}
+
+            /* === GUEST NOTE === */
+            .guest-note {{
+                color: #6a8b88;
+                font-size: 12px;
+                margin-top: 14px;
+                font-weight: 500;
+                text-align: center;
+                width: 100%;
+                display: block;
+            }}
+            </style>
+            """, unsafe_allow_html=True
+        )
+
+        # All login elements inside st.container(border=True) — this is the ONLY reliable
+        # way to get st.button widgets inside a bordered box in Streamlit
+        with st.container(border=True):
+
+            # Header
+            st.markdown(
+                """
+                <div style="text-align:center; padding-bottom:4px;">
+                    <div style="font-size:52px; margin-bottom:14px;">🌿</div>
+                    <div style="color:#0d9488; font-size:32px; font-weight:800; letter-spacing:-0.5px; margin-bottom:6px;">Marsh Warden</div>
+                    <div style="color:#64748b; font-size:14px; font-weight:500; line-height:1.6; margin-bottom:32px;">
+                        Wetland Information &amp; Conservation Policy<br>Support Assistant
+                    </div>
+                </div>
+                """, unsafe_allow_html=True
+            )
+
+            # Buttons
+            auth_url = google_oauth.get_authorization_url()
+            st.markdown(
+                f"""
+                <a href="{auth_url}" class="google-btn">
+                    <svg style="width:18px; height:18px; margin-right:12px;" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                        <path fill="#fff" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                        <path fill="#fff" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                        <path fill="#fff" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                    </svg>
+                    Sign in with Google
+                </a>
+                <a href="?guest=1" class="guest-btn">Login as Guest</a>
+                <div class="guest-note">Access the system without an account</div>
+                """, unsafe_allow_html=True
+            )

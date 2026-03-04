@@ -1,0 +1,14 @@
+{
+  "user_email": "guest@local",
+  "timestamp": "2026-02-20T14:02:12.433190",
+  "title": "what is the definition of wetland?",
+  "messages": [
+    {
+      "role": "user",
+      "content": "what is the definition of wetland?"
+    },
+    {
+      "role": "assistant",
+      "content": "According to the National Wetland Policy, a wetland is defined as: \"areas of marsh, fen, peatland or waters, whether still or flowing, permanently or periodically wet to a depth of at least 60 centimeters\" [National Wetland Policy, p. 3]. Additionally, the policy elaborates that this includes \"areas of vegetation, soil, or water that are inundated or saturated by surface or ground water at a frequency high enough to support, and that under normal circumstances do support, a prevalence of vegetation typically adapted for life in saturated soil conditions\" [National Wetland Policy, p. 3]. While the Fauna and Flora Protection Ordinance offers a simpler definition – \"any marsh, swamp, bog, fen, or other area where the soil is saturated or inundated by surface or ground water\" [Fauna and Flora Protection Ordinance, p. 15] – the National Wetland Policy provides a more comprehensive and current definition.",
+      "references": [
+        
